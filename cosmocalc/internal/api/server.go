@@ -61,21 +61,26 @@ func writeErr(w http.ResponseWriter, status int, typ, field, msg string) {
 	writeJSON(w, status, map[string]any{"error": apiError{Type: typ, Message: msg, Field: field}})
 }
 
-// writeServiceErr maps a service-layer error to a structured response.
-func writeServiceErr(w http.ResponseWriter, err error) {
+// serviceAPIError maps a service-layer error to its structured body and
+// the HTTP status that describes it.
+func serviceAPIError(err error) (apiError, int) {
 	if ce, ok := service.AsCalcError(err); ok {
 		status := http.StatusBadRequest
 		if ce.Kind == calc.ErrBlueshiftDistance {
 			status = http.StatusUnprocessableEntity
 		}
-		writeErr(w, status, string(ce.Kind), ce.Field, ce.Message)
-		return
+		return apiError{Type: string(ce.Kind), Message: ce.Message, Field: ce.Field}, status
 	}
 	if me, ok := service.AsMissingField(err); ok {
-		writeErr(w, http.StatusBadRequest, "missing_field", me.Field, me.Message)
-		return
+		return apiError{Type: "missing_field", Message: me.Message, Field: me.Field}, http.StatusBadRequest
 	}
-	writeErr(w, http.StatusInternalServerError, "internal", "", err.Error())
+	return apiError{Type: "internal", Message: err.Error()}, http.StatusInternalServerError
+}
+
+// writeServiceErr maps a service-layer error to a structured response.
+func writeServiceErr(w http.ResponseWriter, err error) {
+	ae, status := serviceAPIError(err)
+	writeErr(w, status, ae.Type, ae.Field, ae.Message)
 }
 
 // decode reads a JSON request body.
@@ -117,19 +122,35 @@ func (s *Server) handleRedshift(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// computeAndPersistDistance runs one distance computation and stores it
+// as exactly one "distance" history record, regardless of outcome. On
+// success the result is returned with a nil error; on failure the typed
+// API error (and its HTTP status) is returned and the failure itself is
+// persisted as the record's response. This is the single persistence
+// path shared by POST /distance and each line of POST /batch, so a batch
+// line is historically indistinguishable from a single submission.
+func (s *Server) computeAndPersistDistance(r *http.Request, in service.DistanceInput) (*service.DistanceResult, apiError, int) {
+	res, err := service.ComputeDistance(in)
+	if err != nil {
+		ae, status := serviceAPIError(err)
+		s.persist(r, "distance", in, map[string]any{"error": err.Error()})
+		return nil, ae, status
+	}
+	s.persist(r, "distance", in, res)
+	return res, apiError{}, http.StatusOK
+}
+
 func (s *Server) handleDistance(w http.ResponseWriter, r *http.Request) {
 	var in service.DistanceInput
 	if err := decode(r, &in); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_body", "", err.Error())
 		return
 	}
-	res, err := service.ComputeDistance(in)
-	if err != nil {
-		writeServiceErr(w, err)
-		s.persist(r, "distance", in, map[string]any{"error": err.Error()})
+	res, ae, status := s.computeAndPersistDistance(r, in)
+	if res == nil {
+		writeErr(w, status, ae.Type, ae.Field, ae.Message)
 		return
 	}
-	s.persist(r, "distance", in, res)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -171,22 +192,18 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		if id == "" {
 			id = strconv.Itoa(i)
 		}
-		res, err := service.ComputeDistance(item.DistanceInput)
-		if err != nil {
-			ae := apiError{Type: "internal", Message: err.Error()}
-			if ce, ok := service.AsCalcError(err); ok {
-				ae = apiError{Type: string(ce.Kind), Message: ce.Message, Field: ce.Field}
-			} else if me, ok := service.AsMissingField(err); ok {
-				ae = apiError{Type: "missing_field", Message: me.Message, Field: me.Field}
-			}
-			results = append(results, batchResult{ID: id, OK: false, Error: &ae})
+		// Every line is a standalone distance computation and must land
+		// in history as its own "distance" record, including failures,
+		// exactly as if it had been POSTed to /api/v1/distance.
+		res, ae, _ := s.computeAndPersistDistance(r, item.DistanceInput)
+		if res == nil {
+			errCopy := ae
+			results = append(results, batchResult{ID: id, OK: false, Error: &errCopy})
 			continue
 		}
 		results = append(results, batchResult{ID: id, OK: true, Result: res})
 	}
-	resp := map[string]any{"count": len(results), "results": results}
-	s.persist(r, "batch", req, resp)
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, map[string]any{"count": len(results), "results": results})
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {

@@ -67,11 +67,11 @@ curl -X POST localhost:8080/api/v1/batch -d '{"items":[
   {"id":"approaching","rest_wavelength":600,"observed_wavelength":500,"hubble_constant":70}
 ]}'
 ```
-每项独立返回 `ok` + `result` 或结构化 `error`，单项失败不影响其他项。
+每项独立返回 `ok` + `result` 或结构化 `error`，单项失败不影响其他项。**每条谱线（含失败项）都会和单条接口一样作为一条独立的 `distance` 历史记录落库**，因此可按 `type=distance` 逐条检索；批量接口本身不产生额外的汇总记录。
 
 ### `GET /api/v1/history?type=distance&limit=50&offset=0` — 历史查询
 
-按类型（`redshift`/`distance`/`batch`）过滤，按时间倒序返回持久化的请求与结果。
+按类型（`redshift`/`distance`）过滤，按时间倒序返回持久化的请求与结果。
 
 ### `GET /api/v1/demo` — 预置算例
 
@@ -112,6 +112,7 @@ Hα 线（静止 656.28 nm）在 675.9684 nm 被观测（z = 0.03），H₀ = 70
 - 相对论开关与默认线性关系互不混用（z=1：线性 v=c，相对论 v=0.6c；往返变换自洽）
 - 批量计算混合项（成功/蓝移/非法 H₀）各自独立返回
 - 历史持久化：请求落库、按类型过滤、倒序
+- 批量中每条谱线（含失败项）都作为独立的 `distance` 记录落库，可按类型逐条检索；批量与单条并发混发时历史条数恰好等于核算次数，不丢不重不串
 - 并发 64 路请求结果互不串扰、历史记录不重不漏
 
 ## 结构

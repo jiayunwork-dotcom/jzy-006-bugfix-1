@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -264,6 +265,249 @@ func TestHistoryPersistence(t *testing.T) {
 	}
 	if first["id"] == nil || first["created_at"] == nil {
 		t.Fatalf("record must carry id and created_at: %v", first)
+	}
+}
+
+// TestBatchHistory_EachLinePersistedIndependently is the regression test
+// for the bug where a batch landed as a single "batch" summary record:
+// one redshift, one single distance, and one 4-line distance batch must
+// result in 6 history records in total — 1 redshift and 5 distances —
+// each retrievable by type, with its own id/created_at/type.
+func TestBatchHistory_EachLinePersistedIndependently(t *testing.T) {
+	s := newTestServer()
+
+	do(t, s, "POST", "/api/v1/redshift", map[string]any{"redshift": 0.02})
+	do(t, s, "POST", "/api/v1/distance", map[string]any{"redshift": 0.02, "hubble_constant": 70})
+	do(t, s, "POST", "/api/v1/batch", map[string]any{
+		"items": []map[string]any{
+			{"id": "z03", "redshift": 0.03, "hubble_constant": 70},
+			{"id": "z04", "redshift": 0.04, "hubble_constant": 70},
+			{"id": "z05", "redshift": 0.05, "hubble_constant": 70},
+			{"id": "z06", "redshift": 0.06, "hubble_constant": 70},
+		},
+	})
+
+	// 6 computations happened: exactly 6 records must exist.
+	_, all := do(t, s, "GET", "/api/v1/history?limit=100", nil)
+	if got := f64(all["count"]); got != 6 {
+		t.Fatalf("all-history count = %v, want 6", got)
+	}
+	allRecs := all["records"].([]any)
+	for _, r := range allRecs {
+		rm := r.(map[string]any)
+		if rm["id"] == nil || rm["created_at"] == nil || rm["type"] == nil {
+			t.Fatalf("record must carry id, created_at and type: %v", rm)
+		}
+		if typ := rm["type"].(string); typ != "redshift" && typ != "distance" {
+			t.Fatalf("unexpected record type %q (no batch summaries)", typ)
+		}
+	}
+
+	// The four batch lines are ordinary distance records, plus the
+	// single distance: 5 in total.
+	_, distances := do(t, s, "GET", "/api/v1/history?type=distance&limit=100", nil)
+	if got := f64(distances["count"]); got != 5 {
+		t.Fatalf("distance history count = %v, want 5", got)
+	}
+	distRecs := distances["records"].([]any)
+	gotZ := map[float64]int{}
+	for _, r := range distRecs {
+		rm := r.(map[string]any)
+		if rm["type"] != "distance" {
+			t.Fatalf("type-filtered record has type %v", rm["type"])
+		}
+		resp := rm["response"].(map[string]any)
+		gotZ[f64(resp["redshift"])]++
+	}
+	for _, z := range []float64{0.02, 0.03, 0.04, 0.05, 0.06} {
+		if gotZ[z] != 1 {
+			t.Fatalf("distance record for z=%v found %d times, want exactly 1", z, gotZ[z])
+		}
+	}
+
+	// Newest-first: the last batch line (z=0.06) leads the distance list.
+	newest := distRecs[0].(map[string]any)["response"].(map[string]any)
+	if math.Abs(f64(newest["redshift"])-0.06) > 1e-12 {
+		t.Fatalf("newest distance record redshift = %v, want 0.06 (batch order preserved)", newest["redshift"])
+	}
+	// Oldest distance is the single submission (z=0.02).
+	oldest := distRecs[4].(map[string]any)["response"].(map[string]any)
+	if math.Abs(f64(oldest["redshift"])-0.02) > 1e-12 {
+		t.Fatalf("oldest distance record redshift = %v, want 0.02", oldest["redshift"])
+	}
+
+	_, redshifts := do(t, s, "GET", "/api/v1/history?type=redshift", nil)
+	if got := f64(redshifts["count"]); got != 1 {
+		t.Fatalf("redshift history count = %v, want 1", got)
+	}
+}
+
+// TestBatchHistory_FailedLinesPersistedWithError ensures mixed batches
+// persist failures too: every line is one "distance" record, and failed
+// lines carry the error message in their response body.
+func TestBatchHistory_FailedLinesPersistedWithError(t *testing.T) {
+	s := newTestServer()
+	_, body := do(t, s, "POST", "/api/v1/batch", map[string]any{
+		"items": []map[string]any{
+			{"id": "ok-line", "redshift": 0.03, "hubble_constant": 70},
+			{"id": "blueshift-line", "rest_wavelength": 600, "observed_wavelength": 500, "hubble_constant": 70},
+			{"id": "bad-hubble", "redshift": 0.02, "hubble_constant": -1},
+			{"id": "missing-hubble", "redshift": 0.02},
+		},
+	})
+	if f64(body["count"]) != 4 {
+		t.Fatalf("batch returned %v results, want 4", body["count"])
+	}
+
+	_, hist := do(t, s, "GET", "/api/v1/history?type=distance&limit=100", nil)
+	if got := f64(hist["count"]); got != 4 {
+		t.Fatalf("distance history count = %v, want 4 (every line, failures included)", got)
+	}
+	records := hist["records"].([]any)
+	failures := map[string]string{} // id-less mapping by error substring
+	successes := 0
+	for _, r := range records {
+		rm := r.(map[string]any)
+		if rm["type"] != "distance" {
+			t.Fatalf("type = %v, want distance", rm["type"])
+		}
+		if rm["id"] == nil || rm["created_at"] == nil {
+			t.Fatalf("record must carry id and created_at: %v", rm)
+		}
+		resp := rm["response"].(map[string]any)
+		if errMsg, isErr := resp["error"].(string); isErr {
+			failures[errMsg] = errMsg
+		} else {
+			if math.Abs(f64(resp["redshift"])-0.03) > 1e-12 {
+				t.Fatalf("unexpected successful record: %v", resp)
+			}
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("got %d successful records, want 1", successes)
+	}
+	if len(failures) != 3 {
+		t.Fatalf("got %d distinct failure records, want 3: %v", len(failures), failures)
+	}
+
+	// Error text must identify why each line failed, matching the
+	// single-endpoint persistence format {"error": "..."}.
+	joined := ""
+	for _, m := range failures {
+		joined += m + "\n"
+	}
+	if !strings.Contains(joined, "blueshift") {
+		t.Fatalf("blueshift failure not persisted: %q", joined)
+	}
+	if !strings.Contains(joined, "Hubble constant must be positive") {
+		t.Fatalf("non-positive H0 failure not persisted: %q", joined)
+	}
+	if !strings.Contains(joined, "hubble_constant") {
+		t.Fatalf("missing-H0 failure not persisted: %q", joined)
+	}
+}
+
+// TestBatchHistory_ConcurrentBatchesAndSingles fires many batches and
+// single requests concurrently and asserts the number of persisted
+// records equals exactly the number of computations — no loss, no
+// duplication, no cross-talk.
+func TestBatchHistory_ConcurrentBatchesAndSingles(t *testing.T) {
+	s := newTestServer()
+	const (
+		batches    = 16
+		linesBatch = 5
+		singleDist = 32
+		singleRed  = 16
+	)
+	var wg sync.WaitGroup
+	errs := make(chan error, batches+singleDist+singleRed)
+
+	for b := 0; b < batches; b++ {
+		wg.Add(1)
+		go func(b int) {
+			defer wg.Done()
+			items := make([]map[string]any, 0, linesBatch)
+			for j := 0; j < linesBatch; j++ {
+				// Unique z per (batch, line) so cross-talk is detectable.
+				z := 0.001 + float64(b)*0.01 + float64(j)*0.0001
+				items = append(items, map[string]any{
+					"id":              fmt.Sprintf("b%d-%d", b, j),
+					"redshift":        z,
+					"hubble_constant": 70,
+				})
+			}
+			if _, _, err := doReq(s, "POST", "/api/v1/batch", map[string]any{"items": items}); err != nil {
+				errs <- fmt.Errorf("batch %d: %w", b, err)
+			}
+		}(b)
+	}
+	for i := 0; i < singleDist; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			z := 0.5 + float64(i)*0.001
+			rec, _, err := doReq(s, "POST", "/api/v1/distance", map[string]any{
+				"redshift": z, "hubble_constant": 75,
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if rec.Code != http.StatusOK {
+				errs <- fmt.Errorf("single distance %d: status %d", i, rec.Code)
+			}
+		}(i)
+	}
+	for i := 0; i < singleRed; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			z := 0.1 + float64(i)*0.001
+			rec, _, err := doReq(s, "POST", "/api/v1/redshift", map[string]any{"redshift": z})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if rec.Code != http.StatusOK {
+				errs <- fmt.Errorf("single redshift %d: status %d", i, rec.Code)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	wantDist := batches*linesBatch + singleDist
+	wantTotal := wantDist + singleRed
+
+	_, all := do(t, s, "GET", "/api/v1/history?limit=1000", nil)
+	if got := f64(all["count"]); float64(wantTotal) != got {
+		t.Fatalf("total history = %v, want exactly %d computations", got, wantTotal)
+	}
+	_, dist := do(t, s, "GET", "/api/v1/history?type=distance&limit=1000", nil)
+	if got := f64(dist["count"]); float64(wantDist) != got {
+		t.Fatalf("distance history = %v, want %d", got, wantDist)
+	}
+	_, red := do(t, s, "GET", "/api/v1/history?type=redshift&limit=1000", nil)
+	if got := f64(red["count"]); float64(singleRed) != got {
+		t.Fatalf("redshift history = %v, want %d", got, singleRed)
+	}
+
+	// IDs must be unique: no record was saved twice.
+	seenIDs := map[float64]bool{}
+	recs := all["records"].([]any)
+	if len(recs) != wantTotal {
+		t.Fatalf("got %d serialized records, want %d", len(recs), wantTotal)
+	}
+	for _, r := range recs {
+		id := f64(r.(map[string]any)["id"])
+		if seenIDs[id] {
+			t.Fatalf("duplicate persisted record id %v", id)
+		}
+		seenIDs[id] = true
 	}
 }
 
