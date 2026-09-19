@@ -12,7 +12,7 @@ import (
 // Record is one persisted computation request/response pair.
 type Record struct {
 	ID        int64           `json:"id"`
-	Type      string          `json:"type"` // "redshift", "distance" or "batch"
+	Type      string          `json:"type"` // "redshift" or "distance"; batch items are stored under their own computation type
 	Request   json.RawMessage `json:"request"`
 	Response  json.RawMessage `json:"response"`
 	CreatedAt time.Time       `json:"created_at"`

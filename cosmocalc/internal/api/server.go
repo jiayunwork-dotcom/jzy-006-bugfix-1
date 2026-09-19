@@ -140,15 +140,51 @@ type batchRequest struct {
 
 type batchItem struct {
 	ID string `json:"id"`
+	// Type selects the computation for this item: "distance" (default) or
+	// "redshift". It also determines the history record type the item is
+	// persisted under, exactly as if it had been submitted to the
+	// corresponding single endpoint.
+	Type string `json:"type,omitempty"`
 	service.DistanceInput
 }
 
 // batchResult is one item's outcome.
 type batchResult struct {
-	ID     string                  `json:"id"`
-	OK     bool                    `json:"ok"`
-	Result *service.DistanceResult `json:"result,omitempty"`
-	Error  *apiError               `json:"error,omitempty"`
+	ID     string    `json:"id"`
+	OK     bool      `json:"ok"`
+	Result any       `json:"result,omitempty"`
+	Error  *apiError `json:"error,omitempty"`
+}
+
+// toAPIError converts a service-layer error into the structured item error;
+// nil in, nil out.
+func toAPIError(err error) *apiError {
+	if err == nil {
+		return nil
+	}
+	if ce, ok := service.AsCalcError(err); ok {
+		return &apiError{Type: string(ce.Kind), Message: ce.Message, Field: ce.Field}
+	}
+	if me, ok := service.AsMissingField(err); ok {
+		return &apiError{Type: "missing_field", Message: me.Message, Field: me.Field}
+	}
+	return &apiError{Type: "internal", Message: err.Error()}
+}
+
+// runBatchItem executes one batch item and reports the history record type
+// the item belongs to, mirroring the single-endpoint typing.
+func runBatchItem(item batchItem) (recType string, result any, aerr *apiError) {
+	switch item.Type {
+	case "", "distance":
+		res, err := service.ComputeDistance(item.DistanceInput)
+		return "distance", res, toAPIError(err)
+	case "redshift":
+		res, err := service.ComputeRedshift(item.DistanceInput.Input)
+		return "redshift", res, toAPIError(err)
+	default:
+		return "batch", nil, &apiError{Type: "invalid_input", Field: "type",
+			Message: "unknown item type " + strconv.Quote(item.Type) + `: must be "distance" or "redshift"`}
+	}
 }
 
 func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
@@ -171,21 +207,20 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		if id == "" {
 			id = strconv.Itoa(i)
 		}
-		res, err := service.ComputeDistance(item.DistanceInput)
-		if err != nil {
-			ae := apiError{Type: "internal", Message: err.Error()}
-			if ce, ok := service.AsCalcError(err); ok {
-				ae = apiError{Type: string(ce.Kind), Message: ce.Message, Field: ce.Field}
-			} else if me, ok := service.AsMissingField(err); ok {
-				ae = apiError{Type: "missing_field", Message: me.Message, Field: me.Field}
-			}
-			results = append(results, batchResult{ID: id, OK: false, Error: &ae})
+		recType, res, aerr := runBatchItem(item)
+		if aerr != nil {
+			results = append(results, batchResult{ID: id, OK: false, Error: aerr})
+			// Failed items are persisted too, one record each, under the
+			// same type the single endpoint would use for the attempt.
+			s.persist(r, recType, item, map[string]any{"error": aerr.Message})
 			continue
 		}
 		results = append(results, batchResult{ID: id, OK: true, Result: res})
+		// Every item lands in history as its own record, typed like the
+		// single endpoint, so it can be filtered and counted individually.
+		s.persist(r, recType, item, res)
 	}
 	resp := map[string]any{"count": len(results), "results": results}
-	s.persist(r, "batch", req, resp)
 	writeJSON(w, http.StatusOK, resp)
 }
 

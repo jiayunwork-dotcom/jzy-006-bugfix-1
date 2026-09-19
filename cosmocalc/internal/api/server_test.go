@@ -267,6 +267,220 @@ func TestHistoryPersistence(t *testing.T) {
 	}
 }
 
+// Every item of a batch must land in history as its own record, typed
+// like the single endpoint, so the reproduction scenario holds:
+// 1 single redshift + 1 single distance + a 4-item distance batch
+// => 6 total records, 5 distance, 1 redshift.
+func TestBatchItemsPersistedIndividually(t *testing.T) {
+	s := newTestServer()
+	do(t, s, "POST", "/api/v1/redshift", map[string]any{"redshift": 0.01})
+	do(t, s, "POST", "/api/v1/distance", map[string]any{"redshift": 0.02, "hubble_constant": 70})
+
+	rec, body := do(t, s, "POST", "/api/v1/batch", map[string]any{
+		"items": []map[string]any{
+			{"id": "z3", "redshift": 0.03, "hubble_constant": 70},
+			{"id": "z4", "redshift": 0.04, "hubble_constant": 70},
+			{"id": "z5", "redshift": 0.05, "hubble_constant": 70},
+			{"id": "z6", "redshift": 0.06, "hubble_constant": 70},
+		},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("batch status = %d, body = %v", rec.Code, body)
+	}
+	if f64(body["count"]) != 4 {
+		t.Fatalf("batch result count = %v, want 4", body["count"])
+	}
+
+	_, all := do(t, s, "GET", "/api/v1/history?limit=100", nil)
+	if f64(all["count"]) != 6 {
+		t.Fatalf("total history = %v, want 6 (1 redshift + 1 distance + 4 batch items)", all["count"])
+	}
+
+	_, distances := do(t, s, "GET", "/api/v1/history?type=distance&limit=100", nil)
+	if f64(distances["count"]) != 5 {
+		t.Fatalf("distance history = %v, want 5 (1 single + 4 batch items)", distances["count"])
+	}
+	// Newest first: the four batch items (z=0.06..0.03) then the single z=0.02.
+	wantZ := []float64{0.06, 0.05, 0.04, 0.03, 0.02}
+	records := distances["records"].([]any)
+	seenIDs := map[float64]bool{}
+	for i, r := range records {
+		rec := r.(map[string]any)
+		if rec["type"] != "distance" {
+			t.Fatalf("record %d type = %v, want distance", i, rec["type"])
+		}
+		if rec["id"] == nil || rec["created_at"] == nil {
+			t.Fatalf("record %d must carry id and created_at: %v", i, rec)
+		}
+		id := f64(rec["id"])
+		if seenIDs[id] {
+			t.Fatalf("duplicate record id %v", id)
+		}
+		seenIDs[id] = true
+		resp := rec["response"].(map[string]any)
+		if math.Abs(f64(resp["redshift"])-wantZ[i]) > 1e-9 {
+			t.Fatalf("distance record %d redshift = %v, want %v", i, resp["redshift"], wantZ[i])
+		}
+	}
+
+	_, redshifts := do(t, s, "GET", "/api/v1/history?type=redshift&limit=100", nil)
+	if f64(redshifts["count"]) != 1 {
+		t.Fatalf("redshift history = %v, want 1", redshifts["count"])
+	}
+}
+
+// Failed batch items (blueshift distance query, non-positive H0) must each
+// be persisted as their own history record carrying the error, alongside
+// the successful ones.
+func TestBatchFailedItemsPersistedIndividually(t *testing.T) {
+	s := newTestServer()
+	_, body := do(t, s, "POST", "/api/v1/batch", map[string]any{
+		"items": []map[string]any{
+			{"id": "ok-line", "rest_wavelength": 656.28, "observed_wavelength": 675.9684, "hubble_constant": 70},
+			{"id": "blueshift-line", "rest_wavelength": 600, "observed_wavelength": 500, "hubble_constant": 70},
+			{"id": "bad-hubble", "redshift": 0.02, "hubble_constant": -1},
+		},
+	})
+	if f64(body["count"]) != 3 {
+		t.Fatalf("batch result count = %v, want 3", body["count"])
+	}
+
+	_, hist := do(t, s, "GET", "/api/v1/history?type=distance&limit=100", nil)
+	if f64(hist["count"]) != 3 {
+		t.Fatalf("distance history = %v, want 3 (one record per batch item)", hist["count"])
+	}
+	var okRec, errRecs int
+	errByItemID := map[string]string{}
+	for _, r := range hist["records"].([]any) {
+		rec := r.(map[string]any)
+		resp := rec["response"].(map[string]any)
+		req := rec["request"].(map[string]any)
+		if e, hasErr := resp["error"]; hasErr {
+			errRecs++
+			errByItemID[req["id"].(string)] = e.(string)
+			continue
+		}
+		okRec++
+		if _, leaked := resp["distance_mpc"]; !leaked {
+			t.Fatalf("successful record must carry the distance result: %v", resp)
+		}
+	}
+	if okRec != 1 || errRecs != 2 {
+		t.Fatalf("history holds %d ok + %d error records, want 1 + 2", okRec, errRecs)
+	}
+	if errByItemID["blueshift-line"] == "" || errByItemID["bad-hubble"] == "" {
+		t.Fatalf("failed items must carry their error message: %v", errByItemID)
+	}
+}
+
+// A batch item may select the redshift computation explicitly; it must then
+// be persisted under type "redshift", exactly like the single endpoint.
+func TestBatchRedshiftItemsTypedAsRedshift(t *testing.T) {
+	s := newTestServer()
+	_, body := do(t, s, "POST", "/api/v1/batch", map[string]any{
+		"items": []map[string]any{
+			{"id": "z-only", "type": "redshift", "redshift": 0.03},
+			{"id": "with-dist", "redshift": 0.04, "hubble_constant": 70},
+		},
+	})
+	results := body["results"].([]any)
+	byID := map[string]map[string]any{}
+	for _, r := range results {
+		rm := r.(map[string]any)
+		byID[rm["id"].(string)] = rm
+	}
+	if byID["z-only"]["ok"] != true {
+		t.Fatalf("redshift item must succeed without hubble_constant: %v", byID["z-only"])
+	}
+	if _, isDistance := byID["z-only"]["result"].(map[string]any)["distance_mpc"]; isDistance {
+		t.Fatalf("redshift item must not compute a distance: %v", byID["z-only"])
+	}
+
+	_, redshifts := do(t, s, "GET", "/api/v1/history?type=redshift&limit=100", nil)
+	if f64(redshifts["count"]) != 1 {
+		t.Fatalf("redshift history = %v, want 1", redshifts["count"])
+	}
+	_, distances := do(t, s, "GET", "/api/v1/history?type=distance&limit=100", nil)
+	if f64(distances["count"]) != 1 {
+		t.Fatalf("distance history = %v, want 1", distances["count"])
+	}
+	_, all := do(t, s, "GET", "/api/v1/history?limit=100", nil)
+	if f64(all["count"]) != 2 {
+		t.Fatalf("total history = %v, want 2", all["count"])
+	}
+}
+
+// Concurrent batches and single requests: the number of history records
+// must equal the number of computations exactly — none lost, none doubled.
+func TestConcurrentBatchAndSingleExactCount(t *testing.T) {
+	s := newTestServer()
+	const batches = 8
+	const itemsPerBatch = 8
+	const singles = 16
+	const total = batches*itemsPerBatch + singles
+
+	var wg sync.WaitGroup
+	errs := make(chan error, batches+singles)
+	z := 0.01
+	nextZ := func() float64 { z += 0.0001; return z }
+
+	for b := 0; b < batches; b++ {
+		items := make([]map[string]any, 0, itemsPerBatch)
+		for i := 0; i < itemsPerBatch; i++ {
+			items = append(items, map[string]any{"redshift": nextZ(), "hubble_constant": 70})
+		}
+		wg.Add(1)
+		go func(items []map[string]any) {
+			defer wg.Done()
+			rec, body, err := doReq(s, "POST", "/api/v1/batch", map[string]any{"items": items})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if rec.Code != http.StatusOK || f64(body["count"]) != float64(len(items)) {
+				errs <- fmt.Errorf("batch: status %d count %v", rec.Code, body["count"])
+			}
+		}(items)
+	}
+	for i := 0; i < singles; i++ {
+		zv := nextZ()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec, _, err := doReq(s, "POST", "/api/v1/distance", map[string]any{"redshift": zv, "hubble_constant": 70})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if rec.Code != http.StatusOK {
+				errs <- fmt.Errorf("single: status %d", rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	_, hist := do(t, s, "GET", "/api/v1/history?type=distance&limit=1000", nil)
+	if f64(hist["count"]) != total {
+		t.Fatalf("history holds %v records, want exactly %d", hist["count"], total)
+	}
+	seen := map[float64]bool{}
+	for _, r := range hist["records"].([]any) {
+		resp := r.(map[string]any)["response"].(map[string]any)
+		zv := f64(resp["redshift"])
+		if seen[zv] {
+			t.Fatalf("duplicate history entry for z=%v", zv)
+		}
+		seen[zv] = true
+	}
+	if len(seen) != total {
+		t.Fatalf("history holds %d distinct redshifts, want %d", len(seen), total)
+	}
+}
+
 func TestDemoEndpoint(t *testing.T) {
 	s := newTestServer()
 	rec, body := do(t, s, "GET", "/api/v1/demo", nil)
