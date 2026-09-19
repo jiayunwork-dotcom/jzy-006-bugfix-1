@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cosmo
+      POSTGRES_PASSWORD: cosmo
+      POSTGRES_DB: cosmocalc
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cosmo -d cosmocalc"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  app:
+    build: .
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://cosmo:cosmo@db:5432/cosmocalc?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
